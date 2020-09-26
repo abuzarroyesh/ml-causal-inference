@@ -1,0 +1,182 @@
+---
+title: "Final Project"
+author: "Tiffany Cheng, David Kastelman, Yue Li, Abuzar Royesh"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(haven)
+library(tidyverse)
+library(grf)
+library(lfe)
+
+df <- read_spss("data/TongaReplicationData.sav")
+```
+
+
+```{r}
+##Replicating Table 1 
+data <- 
+  df %>%
+  filter(wave == 1) %>% 
+    mutate(
+    below_1 = if_else(r1pcy2 < 350.4, 1, 0), 
+    below_2 = if_else(r1pcy2 < 700.8, 1, 0), 
+    change = wage2007inc - wage2006inc 
+  ) %>% 
+  select(
+    RSEworker, hhsize, nmales1850, englitshare_male1850, postf4share_male1850, 
+    healthverygoodshare_male1850, drinkalcoholshare_male1850, meanhardlab, 
+    shareadultsprevNZ, numrelativesNZ, assetindex, pigs, cattle, chickens, 
+    tongandwell, tongatapu, r1pccons, r1pcy2, maleworker2007, below_1, below_2, 
+    change
+  )
+  
+
+data %>% 
+  group_by(RSEworker) %>% 
+  summarize_all(mean, na.rm = TRUE) %>% 
+  mutate_all(round, 2) %>% 
+  gather(key = variable, value = value, -RSEworker) %>% 
+  spread(key = RSEworker, value = value)
+  
+```
+
+```{r}
+data <- 
+  df %>% 
+  group_by(rse_id) %>% 
+  mutate(
+    inNZnow2 = lead(inNZnow), 
+    inNZnow = coalesce(inNZnow, inNZnow2), 
+    pcy = coalesce(pcy, r1pcy2), 
+    everRSE2 = lead(everRSE), 
+    everRSE3 = coalesce(everRSE2, everRSE), 
+    wave_2 = if_else(wave == 2, 1, 0),
+    wave_3 = if_else(wave == 3, 1, 0),
+    wave_4 = if_else(wave == 4, 1, 0),
+    rse_fixed = if_else(wave == 2, r2RSE, if_else(wave == 3, r3RSE, if_else(wave == 4, r4RSE, 0))), 
+    RSE_post = if_else(r2RSE == 1 & wave >= 2, 1, 0), 
+    RSE_post = if_else((r3repeat == 1 | r3newRSE == 1 | r3returnee == 1) & wave >= 3, 1, RSE_post), 
+    RSE_post = if_else((r4repeat == 1 | r4newRSE == 1 | r4returnee == 1 | r4RSE == 1) & wave == 4, 1, RSE_post)
+  ) %>% 
+  select(-c(inNZnow2, r1pcy2, everRSE2)) %>% 
+  mutate(
+    hhsizeNM = if_else(inNZnow == 1, hhsize - 1, hhsize), 
+    pcy2 = pcy*hhsize/hhsizeNM
+  ) %>% 
+  select(rse_id, wave, everything()) %>% 
+  ungroup()
+```
+
+```{r}
+data %>% 
+  count(rse_id) %>% 
+  filter(n != 4)
+```
+
+```{r}
+data %>% 
+  filter(wave == 4) %>% 
+  count(rse_fixed)
+```
+
+
+```{r}
+data <- 
+  data %>% 
+  left_join(data %>% filter(wave == 4) %>% select(rse_id, rse_fixed), by = "rse_id") %>% 
+  rename(w = rse_fixed.y) %>% 
+  filter(!is.na(w)) %>% 
+  mutate(rse_id = as.integer(rse_id))
+
+```
+
+###estimating p-score through ML
+
+```{r}
+Xmod <- 
+  data %>% 
+  filter(wave == 1) %>% 
+  select_if(is.numeric) %>% 
+  select(
+    -c(
+      pcy, w, rse_fixed.x, wave, pcy2, pcy, wave, RSEworker, everRSE, r2RSE, 
+      r3repeat,r3newRSE, r3returnee, r3RSE, r4repeat,r4newRSE, r4returnee, 
+      r4RSE, seq_no, everRSE3, RSEapplicant, RSE_post, stockRSE, wave_2, wave_3, 
+      wave_4, rse_id
+    )
+  ) %>% 
+  as.matrix()
+
+Ymod <- data %>% filter(wave == 1)  %>% select(pcy) %>% pull()
+Wmod <- data %>% filter(wave == 1) %>% select(w) %>% pull()
+
+cf <- causal_forest(Xmod, Ymod, Wmod, num.trees = 500)
+
+pscore <- 
+  data %>% 
+  filter(wave == 1) %>% 
+  distinct(rse_id) %>% 
+  cbind(pscore = cf$W.hat)
+  
+ps_df <- 
+  data %>% 
+  left_join(pscore, by = "rse_id") %>% 
+  select(rse_id, pcy, w, pscore, wave, everything()) %>% 
+  filter(pscore > 0.1, pscore < 0.9) %>% 
+  mutate(
+    wave = as.factor(wave), 
+    rse_id = as.factor(rse_id)
+  )
+  
+fit <- felm(pcy ~ rse_fixed.x | rse_id + wave, data = ps_df)
+summary(fit)
+```
+
+
+###Doubly Robust
+```{r}
+aipw_ols <- function(dataset, p) {
+  
+  ols.fit = lm(pcy ~ rse_fixed.x + rse_id + wave, data = ps_df)
+  
+  dataset.treatall = dataset
+  dataset.treatall$rse_fixed.x = 1
+  treated_pred = predict(ols.fit, dataset.treatall)
+  
+  dataset.treatnone = dataset
+  dataset.treatnone$rse_fixed.x = 0
+  control_pred = predict(ols.fit, dataset.treatnone)
+  
+  actual_pred = predict(ols.fit, dataset)
+  
+  G <- treated_pred - control_pred +
+    ((dataset$rse_fixed.x - p) * (dataset$pcy - actual_pred)) / (p * (1 - p))
+  tau.hat <- mean(G)
+  se.hat <- sqrt(var(G) / (length(G) - 1))
+  c(ATE = tau.hat, lower_ci = tau.hat - 1.96 * se.hat, upper_ci = tau.hat + 1.96 * se.hat)
+}
+
+p <- ps_df %>% pull(pscore)
+
+tauhat_lin_logistic_aipw <- aipw_ols(ps_df, p)
+tauhat_lin_logistic_aipw
+```
+
+###Diagnostics for Doubly Robust
+```{r}
+hist(pscore$pscore, main = "Histogram of Propensity Score", xlab = "Propensity Score")
+
+{plot(smooth.spline(pscore$pscore, Wmod, df = 4))
+abline(0, 1)}
+
+summary(pscore$pscore)
+```
+
+
+
